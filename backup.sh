@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Writes a compressed logical backup to deploy/backups and keeps the newest 14.
-# Schedule daily with cron, e.g.: 30 2 * * * /home/ubuntu/knot/deploy/backup.sh >> /var/log/knot-backup.log 2>&1
+# Backs up the database AND the uploads volume (photos, videos, posters, chat images) with one timestamp.
+# A database restored without its media would point at files that no longer exist.
+# Keeps the 14 most recent pairs. Copy deploy/backups off the instance (object storage) — see docs/DEPLOYMENT.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; source deploy/.env.production; set +a
+COMPOSE="docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.production"
 mkdir -p deploy/backups
-FILE="knot-$(date -u +%Y%m%dT%H%M%SZ).dump"
-docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.production exec -T postgres \
-  pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --compress=9 > "deploy/backups/$FILE"
-echo "Backup written: deploy/backups/$FILE"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+DB="deploy/backups/knot-$STAMP.dump"
+MEDIA="deploy/backups/knot-$STAMP-uploads.tar.gz"
+
+$COMPOSE exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --compress=9 > "$DB"
+# Media is archived after the dump, so every file the dump references already exists in the archive
+# (uploads only ever add new random names; deletions are the only way a file disappears).
+$COMPOSE exec -T api tar -C /data -czf - uploads > "$MEDIA"
+[ -s "$DB" ] && [ -s "$MEDIA" ] || { echo "Backup failed: empty output" >&2; exit 1; }
+echo "Backup written: $DB and $MEDIA"
+
 ls -1t deploy/backups/knot-*.dump | tail -n +15 | xargs -r rm --
-# Optional off-site copy (recommended): aws s3 cp "deploy/backups/$FILE" "s3://YOUR-BUCKET/knot/$FILE"
+ls -1t deploy/backups/knot-*-uploads.tar.gz 2>/dev/null | tail -n +15 | xargs -r rm --
