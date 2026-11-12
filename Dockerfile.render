@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+# Single-container test deployment for Render: builds web + server from their own GitHub
+# repos and glues them behind one Caddy origin (same pattern as Caddyfile, just without TLS
+# since Render terminates HTTPS for us). Build context is this `deploy` repo itself; the
+# web/server source is pulled by `git clone` during the build, not copied from a sibling dir.
+#
+# server and web are PRIVATE repos, so the clone needs a token. Render: add a Secret File
+# named `github_token` (dashboard > Environment > Secret Files) containing a GitHub personal
+# access token with read-only "Contents" access to the Mavellee/server and Mavellee/web repos.
+# BuildKit mounts it only for the RUN step below — it is never written into an image layer.
+#
+# Render service settings: Dockerfile Path = Dockerfile.render, Docker Build Context = . , Port = 10000
+
+ARG REPO_BRANCH=feature/1stversion
+
+FROM node:22-alpine AS web-build
+ARG REPO_BRANCH
+WORKDIR /app
+RUN apk add --no-cache git
+RUN --mount=type=secret,id=github_token \
+    git clone --branch ${REPO_BRANCH} --depth 1 "https://x-access-token:$(cat /run/secrets/github_token)@github.com/Mavellee/web.git" .
+RUN npm ci --no-audit --no-fund
+RUN npx vite build
+
+FROM node:22-alpine AS server-build
+ARG REPO_BRANCH
+WORKDIR /app
+RUN apk add --no-cache git openssl
+RUN --mount=type=secret,id=github_token \
+    git clone --branch ${REPO_BRANCH} --depth 1 "https://x-access-token:$(cat /run/secrets/github_token)@github.com/Mavellee/server.git" .
+RUN npm ci --no-audit --no-fund
+RUN npx prisma generate
+RUN npm run build
+
+FROM node:22-alpine AS server-deps
+ARG REPO_BRANCH
+WORKDIR /app
+RUN apk add --no-cache git
+RUN --mount=type=secret,id=github_token \
+    git clone --branch ${REPO_BRANCH} --depth 1 "https://x-access-token:$(cat /run/secrets/github_token)@github.com/Mavellee/server.git" .
+RUN npm ci --omit=dev --no-audit --no-fund
+
+FROM node:22-alpine
+RUN apk add --no-cache openssl tini
+# Caddy ships as a single static Go binary; copying just the binary avoids mixing Alpine
+# base versions for the Node native modules (argon2, Prisma engines) built above.
+COPY --from=caddy:2.8-alpine /usr/bin/caddy /usr/bin/caddy
+WORKDIR /app
+COPY --from=server-deps /app/node_modules ./node_modules
+COPY --from=server-build /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=server-build /app/dist ./dist
+COPY --from=server-build /app/prisma ./prisma
+COPY --from=server-build /app/package.json ./package.json
+COPY --from=web-build /app/dist /srv
+COPY Caddyfile.render /etc/caddy/Caddyfile
+COPY render-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh && mkdir -p /data/uploads
+ENV NODE_ENV=production UPLOAD_DIR=/data/uploads
+EXPOSE 10000
+ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
