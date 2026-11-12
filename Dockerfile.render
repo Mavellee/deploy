@@ -41,10 +41,10 @@ RUN --mount=type=secret,id=github_token \
 RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM node:22-alpine
-RUN apk add --no-cache openssl tini
-# Caddy ships as a single static Go binary; copying just the binary avoids mixing Alpine
-# base versions for the Node native modules (argon2, Prisma engines) built above.
-COPY --from=caddy:2.8-alpine /usr/bin/caddy /usr/bin/caddy
+# Installed via apk rather than `COPY --from=caddy:...`: Caddy's binary has a Linux capability
+# (cap_net_bind_service) baked into its file metadata, which doesn't survive being copied
+# across build stages and left it unable to exec ("Operation not permitted").
+RUN apk add --no-cache openssl tini caddy
 WORKDIR /app
 COPY --from=server-deps /app/node_modules ./node_modules
 COPY --from=server-build /app/node_modules/.prisma ./node_modules/.prisma
